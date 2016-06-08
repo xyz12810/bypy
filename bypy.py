@@ -44,7 +44,7 @@ from __future__ import print_function
 from __future__ import division
 
 ### special variables that say about this module
-__version__ = '1.2.16'
+__version__ = '1.2.18'
 
 ### return (error) codes
 # they are put at the top because:
@@ -75,6 +75,7 @@ EUserRejected = 190 # user's decision
 EFatal = -1 # No way to continue
 # internal errors
 IEMD5NotFound = 31079 # File md5 not found, you should use upload API to upload the whole file.
+IESuperfileCreationFailed = 31081 # superfile create failed
 
 def bannerwarn(msg):
 	print('!' * 160)
@@ -82,9 +83,13 @@ def bannerwarn(msg):
 	print('!' * 160)
 
 ### imports
+import os
+def iswindows():
+	return os.name == 'nt'
+
 # version check must pass before any further action
 import sys
-if sys.platform.startswith('win32'):
+if iswindows():
 	bannerwarn("You are running Python on Windows, which doesn't support Unicode so well.\n"
 		"Files with non-ASCII names may not be handled correctly.")
 
@@ -99,7 +104,6 @@ or (sys.version_info[0] == 2 and sys.version_info[1] < 7) \
 or (sys.version_info[0] == 3 and sys.version_info[1] < 3):
 	print("Error: Incorrect Python version. You need 2.7 / 3.3 or above")
 	sys.exit(EIncorrectPythonVersion)
-import os
 import io
 import locale
 import codecs
@@ -124,6 +128,17 @@ else:
 # no idea who screws the sys.stdout.encoding
 # the locale is 'UTF-8', sys.stdin.encoding is 'UTF-8',
 # BUT, sys.stdout.encoding is None ...
+def fixenc(stdenc):
+	if iswindows():
+		bannerwarn("WARNING: StdOut encoding '{}' is unable to encode CJK strings.\n" \
+			"Files with non-ASCII names may not be handled correctly.".format(stdenc))
+	else:
+		# fix by @xslidian
+		if not stdenc:
+			stdenc = 'utf-8'
+		sys.stdout = codecs.getwriter(stdenc)(sys.stdout)
+		sys.stderr = codecs.getwriter(stdenc)(sys.stderr)
+
 stdenc = sys.stdout.encoding
 if stdenc:
 	stdencu = stdenc.upper()
@@ -131,14 +146,10 @@ if stdenc:
 		print("Encoding for StdOut: {}".format(stdenc))
 		try:
 			'\u6c49\u5b57'.encode(stdenc) # '汉字'
-			#sys.stdout = codecs.getwriter(stdenc)(sys.stdout)
-			#sys.stderr = codecs.getwriter(stdenc)(sys.stderr)
 		except: # (LookupError, TypeError, UnicodeEncodeError):
-			bannerwarn("WARNING: StdOut encoding '{}' is unable to encode CJK strings.\n" \
-			  "Files with non-ASCII names may not be handled correctly.".format(stdenc))
+			fixenc(stdenc)
 else:
-	bannerwarn("WARNING: StdOut encoding is '{}'.\n" \
-	  "Files with non-ASCII names may not be handled correctly.".format(stdenc))
+	fixenc(stdenc)
 
 import signal
 import time
@@ -166,6 +177,8 @@ elif sys.version_info[0] == 3:
 	long = int
 	raw_input = input
 	pickleload = partial(pickle.load, encoding="bytes")
+
+from subprocess import call
 import json
 import hashlib
 import base64
@@ -185,6 +198,15 @@ except:
 	print("Fail to import the 'requests' library.\n"
 		"You need to install it by running '{}".format(PipInstallCommand))
 	raise
+
+try:
+	from requests.packages.urllib3.exceptions import ReadTimeoutError
+except:
+	try:
+		from urllib3.exceptions import ReadTimeoutError
+	except:
+		print("Something seems wrong with the urllib3 installation.\nQuitting")
+		sys.exit(EFatal)
 
 # there was a WantWriteError uncaught exception for Urllib3:
 # https://github.com/shazow/urllib3/pull/412
@@ -292,6 +314,14 @@ HashCacheFileName = 'bypy.hashcache.json'
 HashCachePath = ConfigDir + os.sep + HashCacheFileName
 PickleFileName = 'bypy.pickle'
 PicklePath = ConfigDir + os.sep + PickleFileName
+# ProgressPath saves the MD5s of uploaded slices, for upload resuming
+# format:
+# {
+# 	abspath: [slice_size, [slice1md5, slice2md5, ...]],
+# }
+#
+ProgressFileName = 'bypy.parts.json'
+ProgressPath = ConfigDir + os.sep + ProgressFileName
 ByPyCertsFileName = 'bypy.cacerts.pem'
 ByPyCertsPath = ConfigDir + os.sep + ByPyCertsFileName
 # Old setting locations, should be moved to ~/.bypy to be clean
@@ -367,7 +397,7 @@ def prc(msg):
 pr = prc
 
 def prcolorc(msg, fg, bg):
-	if sys.stdout.isatty() and not sys.platform.startswith('win32'):
+	if sys.stdout.isatty() and not iswindows():
 		pr(colorstr(msg, fg, bg))
 	else:
 		pr(msg)
@@ -419,12 +449,13 @@ def pprgrc(finish, total, start_time = None, existing = 0,
 	if total > 0:
 		segth = seg * finish // total
 		percent = 100 * finish // total
+		current_batch_percent = 100 * (finish - existing) // total
 	else:
 		segth = seg
 		percent = 100
 	eta = ''
 	now = time.time()
-	if start_time is not None and percent > 5 and finish > 0:
+	if start_time is not None and current_batch_percent > 5 and finish > 0:
 		finishf = float(finish) - float(existing)
 		totalf = float(total)
 		remainf = totalf - float(finish)
@@ -742,7 +773,7 @@ def joinpath(first, second, sep = os.sep):
 # http://houtianze.github.io/python/unicode/json/2016/01/03/another-python-unicode-fisaco-on-json.html
 def py2_jsondump(data, filename):
 	with io.open(filename, 'w', encoding = 'utf-8') as f:
-		f.write(json.dumps(data, f, ensure_ascii = False, sort_keys = True, indent = 2))
+		f.write(unicode(json.dumps(data, ensure_ascii = False, sort_keys = True, indent = 2)))
 
 def py3_jsondump(data, filename):
 	with io.open(filename, 'w', encoding = 'utf-8') as f:
@@ -1107,7 +1138,7 @@ class PathDictTree(dict):
 		place = self
 		if path:
 			# Linux can have file / folder names with '\\'?
-			if sys.platform.startswith('win32'):
+			if iswindows():
 				assert '\\' not in path
 			route = filter(None, path.split('/'))
 			for part in route:
@@ -1366,6 +1397,7 @@ class ByPy(object):
 		configdir = ConfigDir,
 		requester = RequestsRequester,
 		apikey = ApiKey,
+		use_aria2c = False,
 		secretkey = SecretKey):
 
 		super(ByPy, self).__init__()
@@ -1382,6 +1414,9 @@ class ByPy(object):
 		self.__tokenpath = configdir + os.sep + TokenFileName
 		self.__settingpath = configdir + os.sep + SettingFileName
 		self.__setting = {}
+
+		self.use_aria2c = use_aria2c
+
 		if os.path.exists(self.__settingpath):
 			try:
 				self.__setting = jsonload(self.__settingpath)
@@ -1661,7 +1696,7 @@ class ByPy(object):
 					self.pd("MD5 not found, rapidupload failed")
 					result = ec
 				# superfile create failed
-				elif ec == 31081: # and sc == 404:
+				elif ec == IESuperfileCreationFailed: # and sc == 404:
 					self.pd("Failed to combine files from MD5 slices (superfile create failed)")
 					result = ec
 				# errors that make retrying meaningless
@@ -1688,7 +1723,8 @@ class ByPy(object):
 					if result == ERequestFailed and dumpex:
 						self.__dump_exception(None, url, pars, r, act)
 		except (requests.exceptions.RequestException,
-				socket.error) as ex:
+				socket.error,
+				ReadTimeoutError) as ex:
 			# If certificate check failed, no need to continue
 			# but prompt the user for work-around and quit
 			# why so kludge? because requests' SSLError doesn't set
@@ -2308,6 +2344,16 @@ get information of the given path (dir / file) at Baidu Yun.
 				#files = { 'file' : (os.path.basename(self.__current_file), self.__current_slice) } )
 				files = { 'file' : ('file', self.__current_slice) } )
 
+	def __update_progress_entry(self, fullpath):
+		progress = jsonload(ProgressPath)
+		progress[fullpath]=(self.__slice_size, self.__slice_md5s)
+		jsondump(progress, ProgressPath)
+
+	def __delete_progress_entry(self, fullpath):
+		progress = jsonload(ProgressPath)
+		progress.remove(fullpath)
+		jsondump(progress, ProgressPath)
+
 	def __upload_file_slices(self, localpath, remotepath, ondup = 'overwrite'):
 		pieces = MaxSlicePieces
 		slice = self.__slice_size
@@ -2325,8 +2371,40 @@ get information of the given path (dir / file) at Baidu Yun.
 
 		i = 0
 		ec = ENoError
+
+		fullpath = os.path.abspath(self.__current_file)
+		progress = {}
+		initial_offset = 0
+		if not os.path.exists(ProgressPath):
+			jsondump(progress, ProgressPath)
+		progress = jsonload(ProgressPath)
+		if fullpath in progress:
+			self.pd("Find the progress entry resume uploading")
+			(slice, md5s) = progress[fullpath]
+			self.__slice_md5s = []
+			with io.open(self.__current_file, 'rb') as f:
+				self.pd("Verifying the md5s. Total count = {}".format(len(md5s)))
+				for md in md5s:
+					cslice = f.read(slice)
+					cm = hashlib.md5(cslice)
+					if (binascii.hexlify(cm.digest()) == md):
+						self.pd("{} verified".format(md))
+						# TODO: a more rigorous check would be also verifying
+						# slices exist at Baidu Yun as well (rapidupload test?)
+						# but that's a bit complex. for now, we don't check
+						# this but simply delete the progress entry if later
+						# we got error combining the slices.
+						self.__slice_md5s.append(md)
+					else:
+						break
+				self.pd("verified md5 count = {}".format(len(self.__slice_md5s)))
+			i = len(self.__slice_md5s)
+			initial_offset = i * slice
+			self.pd("Start from offset {}".format(initial_offset))
+
 		with io.open(self.__current_file, 'rb') as f:
 			start_time = time.time()
+			f.seek(initial_offset, os.SEEK_SET)
 			while i < pieces:
 				self.__current_slice = f.read(slice)
 				m = hashlib.md5()
@@ -2340,7 +2418,8 @@ get information of the given path (dir / file) at Baidu Yun.
 					ec = self.__upload_slice(remotepath)
 					if ec == ENoError:
 						self.pd("Slice MD5 match, continuing next slice")
-						pprgr(f.tell(), self.__current_file_size, start_time)
+						pprgr(f.tell(), self.__current_file_size, start_time, initial_offset)
+						self.__update_progress_entry(fullpath)
 						break
 					elif j < self.__retry:
 						j += 1
@@ -2360,7 +2439,13 @@ get information of the given path (dir / file) at Baidu Yun.
 		else:
 			#self.pd("Sleep 2 seconds before combining, just to be safer.")
 			#time.sleep(2)
-			return self.__combine_file(remotepath, ondup = 'overwrite')
+			ec = self.__combine_file(remotepath, ondup = 'overwrite')
+			if ec == ENoError or ec == IESuperfileCreationFailed:
+				# we delete the upload progress entry also when we can't combine
+				# the file, as it might be caused by  the slices uploaded
+				# has expired / become invalid
+				self.__delete_progress_entry(fullpath)
+			return ec
 
 	def __rapidupload_file_act(self, r, args):
 		if self.__verify:
@@ -2703,6 +2788,31 @@ try to create a file at PCS by combining slices, having MD5s specified
 				else:
 					return EFileWrite
 
+	def __down_aria2c(self, remotefile, localfile):
+		url = "{}{}".format(dpcsurl, "file")
+
+		rfile = remotefile
+
+		# in python 2, the urlencode will fail
+		# when the parameters is unicode and has non-ascii characters
+		# we manually encode it
+		if sys.version_info[0] == 2 and isinstance(rfile, unicode):
+			rfile = remotefile.encode("utf-8")
+
+		pars = {
+				"method": "download",
+				"path": rfile,
+				"access_token": self.__access_token,
+				}
+
+		full_url = "{}?{}".format(url, ulp.urlencode(pars))
+
+		cmd = "aria2c -c --user-agent='{}' -k10M -x10 -s10 -o '{}' '{}'".format(UserAgent, localfile, full_url)
+		self.pd("call: {}".format(cmd))
+		ret = call(cmd, shell=True)
+		self.pd("aria2c exit with status: {}".format(ret))
+		return ret
+
 	# requirment: self.__remote_json is already gotten
 	def __downchunks(self, rfile, start):
 		rsize = self.__remote_json['size']
@@ -2765,6 +2875,7 @@ try to create a file at PCS by combining slices, having MD5s specified
 
 		return result
 
+
 	def __downfile(self, remotefile, localfile):
 		# TODO: this is a quick patch
 		if not self.__shallinclude(localfile, remotefile, False):
@@ -2824,7 +2935,10 @@ try to create a file at PCS by combining slices, having MD5s specified
 				perr("Fail to make directory '{}'".format(ldir))
 				return result
 
+		if self.use_aria2c:
+			return self.__down_aria2c(rfile, localfile)
 		return self.__downchunks(rfile, offset)
+
 
 	def downfile(self, remotefile, localpath = ''):
 		''' Usage: downfile <remotefile> [localpath] - \
@@ -4136,7 +4250,7 @@ def setsighandler(signum, handler):
 	return oldhandler
 
 def setuphandlers():
-	if sys.platform == 'win32':
+	if iswindows():
 		# setsighandler(signal.CTRL_C_EVENT, sighandler)
 		# setsighandler(signal.CTRL_BREAK_EVENT, sighandler)
 		# bug, see: http://bugs.python.org/issue9524
@@ -4213,6 +4327,10 @@ def getparser():
 	parser.add_argument(CaCertsOption, dest="cacerts", help="Specify the path for CA Bundle [default: %(default)s]")
 	parser.add_argument("--mirror", dest="mirror", default=None, help="Specify the PCS mirror (e.g. bj.baidupcs.com. Open 'https://pcs.baidu.com/rest/2.0/pcs/manage?method=listhost' to get the list) to use. [default: " + PcsDomain + "]")
 	parser.add_argument("--rapid-upload-only", dest="rapiduploadonly", action="store_true", help="only upload large files that can be rapidly uploaded")
+
+	# support aria2c
+	parser.add_argument("--use-aria2c", dest="use_aria2c", default=False, action="store_true", help="use aria2c as downloader, default aria2 arguments is:  -c -k10M -x10 -s10")
+
 	# i think there is no need to expose this config option to the command line interface
 	#parser.add_argument("--config-dir", dest="configdir", default=ConfigDir, help="specify the config path [default: %(default)s]")
 
@@ -4317,6 +4435,7 @@ def main(argv=None): # IGNORE:C0111
 					cacerts = args.cacerts,
 					rapiduploadonly = args.rapiduploadonly,
 					mirror = args.mirror,
+					use_aria2c = args.use_aria2c,
 					verbose = args.verbose, debug = args.debug)
 			uargs = []
 			for arg in args.command[1:]:
